@@ -153,7 +153,7 @@ test-ci: build-standalone-ci
 
 test-ci-coverage:
 	BABEL_ENV=test $(MAKE) bootstrap
-	BABEL_ENV=test BABEL_COVERAGE=true $(YARN) c8 jest --maxWorkers=100% --ci
+	BABEL_ENV=test BABEL_COVERAGE=true $(YARN) c8 jest --maxWorkers=100% --ci $(SEAL_JEST_ARGS)
 	rm -rf coverage/tmp
 
 bootstrap-flow:

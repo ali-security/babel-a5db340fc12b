@@ -1,6 +1,305 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional Jest test path pattern"
+        required: false
+        default: ""
+
+# browserslist prints "caniuse-lite is outdated" to stderr when its pinned
+# caniuse-lite data is old; stderr-asserting test harnesses fail on that line.
+env:
+  BROWSERSLIST_IGNORE_OLD_DATA: "1"
+  # Jest prints only a count of skipped tests. This script reads Jest's
+  # --json results and names every skipped test with the reason it does not
+  # run on that leg (Babel-8-only fixture, minimum Node version, platform...).
+  SEAL_JEST_SKIP_REPORT: |
+    var fs = require("fs");
+    var path = require("path");
+    var file = process.argv[1];
+    if (!file || !fs.existsSync(file)) {
+      console.log("Jest skipped-test report: no Jest JSON results at " + file);
+      process.exit(0);
+    }
+    var res = JSON.parse(fs.readFileSync(file, "utf8"));
+    var babel8 = /^(1|true)$/i.test(process.env.BABEL_8_BREAKING || "");
+    var nodeMajor = parseInt(process.versions.node, 10);
+    var root = process.cwd();
+    var fixtureIdx = Object.create(null);
+    var srcCache = Object.create(null);
+
+    function hum(s) {
+      return s.replace(/-/g, " ");
+    }
+    function readJSON(p) {
+      try {
+        return JSON.parse(fs.readFileSync(p, "utf8"));
+      } catch (e) {
+        return {};
+      }
+    }
+    // Fixture options live in options.json or options.js; only the
+    // BABEL_8_BREAKING / minNodeVersion keys matter here, so read options.js
+    // as text instead of executing it.
+    function readOpts(d) {
+      var o = readJSON(path.join(d, "options.json"));
+      var js;
+      try {
+        js = fs.readFileSync(path.join(d, "options.js"), "utf8");
+      } catch (e) {
+        return o;
+      }
+      var b8 = js.match(/BABEL_8_BREAKING["']?\s*:\s*(true|false)/);
+      if (b8) o.BABEL_8_BREAKING = b8[1] === "true";
+      var mn = js.match(/minNodeVersion["']?\s*:\s*["']([\d.]+)["']/);
+      if (mn) o.minNodeVersion = mn[1];
+      return o;
+    }
+    function testRoot(f) {
+      var d = path.dirname(f);
+      while (d !== path.dirname(d) && d.length >= root.length) {
+        if (path.basename(d) === "test") return d;
+        d = path.dirname(d);
+      }
+      return path.dirname(f);
+    }
+    function indexFixtures(dir) {
+      if (fixtureIdx[dir]) return fixtureIdx[dir];
+      var idx = Object.create(null);
+      var walk = function (d, depth) {
+        if (depth > 6) return;
+        var names;
+        try {
+          names = fs.readdirSync(d);
+        } catch (e) {
+          return;
+        }
+        names.forEach(function (n) {
+          if (n === "node_modules" || n === "tmp") return;
+          var p = path.join(d, n);
+          var st;
+          try {
+            st = fs.statSync(p);
+          } catch (e) {
+            return;
+          }
+          if (!st.isDirectory()) return;
+          // @babel/helper-fixtures titles a task by its directory name with
+          // the extension-like suffix stripped ("entry-node-10.13" -> "entry node 10").
+          var noext = path.basename(n, path.extname(n));
+          [n, hum(n), noext, hum(noext)].forEach(function (k) {
+            (idx[k] = idx[k] || []).push(p);
+          });
+          walk(p, depth + 1);
+        });
+      };
+      walk(dir, 0);
+      fixtureIdx[dir] = idx;
+      return idx;
+    }
+    function fixtureReason(tr, a) {
+      var title = a.title.replace(/ start = \(\d+, \d+\)$/, "");
+      var segs = a.ancestorTitles.concat([title]).join("/").split("/");
+      var task = segs[segs.length - 1];
+      var suite = segs[segs.length - 2];
+      var cands = indexFixtures(testRoot(tr.name))[task] || [];
+      var hits = cands.filter(function (p) {
+        var parent = path.basename(path.dirname(p));
+        return parent === suite || hum(parent) === suite;
+      });
+      if (!hits.length && cands.length === 1) hits = cands;
+      if (!hits.length) return null;
+      var dir = hits[0];
+      var rel = path.relative(root, dir).replace(/\\/g, "/");
+      var o = readOpts(path.dirname(dir));
+      var t = readOpts(dir);
+      Object.keys(t).forEach(function (k) {
+        o[k] = t[k];
+      });
+      if (path.basename(dir)[0] === ".")
+        return "fixture " + rel + " has a '.'-prefixed directory name, which @babel/helper-fixtures treats as disabled";
+      if (o.BABEL_8_BREAKING === true && !babel8)
+        return "Babel 8-only fixture " + rel + " (options.json \"BABEL_8_BREAKING\": true); this leg tests Babel 7";
+      if (o.BABEL_8_BREAKING === false && babel8)
+        return "Babel 7-only fixture " + rel + " (options.json \"BABEL_8_BREAKING\": false); this leg tests Babel 8";
+      if (o.minNodeVersion && nodeMajor < parseInt(o.minNodeVersion, 10))
+        return "fixture " + rel + " requires Node >= " + o.minNodeVersion + " (options.json minNodeVersion); this leg runs Node " + process.versions.node;
+      return null;
+    }
+    // batch-test-runner/*.js run the process fixtures in ../fixtures/<suite>/<test>
+    // through buildProcessTests (@babel/helper-transform-fixture-test-runner),
+    // titled "<suite> <test>"; its skip condition reads that fixture's options.json.
+    function batchReason(tr, a) {
+      if (!/batch-test-runner/.test(tr.name)) return null;
+      var fdir = path.join(path.dirname(path.dirname(tr.name)), "fixtures");
+      var title = a.title.replace(/ \(flaky\)$/, "");
+      var suites;
+      try {
+        suites = fs.readdirSync(fdir);
+      } catch (e) {
+        return null;
+      }
+      for (var si = 0; si < suites.length; si++) {
+        var su = suites[si];
+        if (title.indexOf(su + " ") !== 0) continue;
+        var tdir = path.join(fdir, su, title.slice(su.length + 1));
+        if (!fs.existsSync(tdir)) continue;
+        var rel = path.relative(root, tdir).replace(/\\/g, "/");
+        var o = readJSON(path.join(tdir, "options.json"));
+        if (o.minNodeVersion && nodeMajor < o.minNodeVersion)
+          return "process fixture " + rel + " requires Node >= " + o.minNodeVersion + " (options.json minNodeVersion); this leg runs Node " + process.versions.node;
+        if (o.BABEL_8_BREAKING === false)
+          return "process fixture " + rel + " sets options.json \"BABEL_8_BREAKING\": false; buildProcessTests skips every such fixture on every leg (upstream skip condition `opts.BABEL_8_BREAKING === false`)";
+        if (o.flaky && !process.env.BABEL_CLI_FLAKY_TESTS)
+          return "process fixture " + rel + " is marked flaky (options.json) and BABEL_CLI_FLAKY_TESTS is not set";
+      }
+      return null;
+    }
+    function src(f) {
+      if (srcCache[f] === undefined) {
+        try {
+          srcCache[f] = fs.readFileSync(f, "utf8").split(/\r?\n/);
+        } catch (e) {
+          srcCache[f] = [];
+        }
+      }
+      return srcCache[f];
+    }
+    function explain(code) {
+      var c = code.replace(/\s+/g, " ").trim();
+      var skipFirst = /BABEL(_TYPES)?_8_BREAKING\s*(\|\|[^?]*)?\?\s*(it|test|describe)\.skip/.test(c);
+      var skipSecond = /BABEL(_TYPES)?_8_BREAKING\s*\?\s*(it|test|describe)\s*:\s*(it|test|describe)\.skip/.test(c);
+      if (skipSecond) return "Babel 8-only test, enabled only when BABEL_8_BREAKING is set; this leg tests Babel 7";
+      if (skipFirst && /USE_ESM/.test(c)) return "Babel 7 CommonJS-only test, disabled under BABEL_8_BREAKING or the USE_ESM build";
+      if (skipFirst) return "Babel 7-only test, disabled when BABEL_8_BREAKING is set; this leg tests Babel 8";
+      if (/isESLint7\s*\?\s*it\s*:\s*it\.skip/.test(c)) return "ESLint 7-only test (isESLint7 gate), run by the 'Test @babel/eslint-* with ESLint 7.5.0' job; this leg uses ESLint 8";
+      if (/isESLint7\s*\?\s*it\.skip/.test(c)) return "test not applicable to ESLint 7 (isESLint7 gate); this leg runs ESLint 7.5.0 and the ESLint 8 legs run it";
+      if (/USE_ESM\s*\?\s*it\s*:\s*it\.skip/.test(c)) return "test only applies to the ESM build of Babel (USE_ESM gate), run by the 'Test ESM version' job; this leg tests the CommonJS build";
+      if (/shouldSkip\s*\?\s*describe\s*:\s*describe\.skip/.test(c)) return "placeholder 'dummy' suite that runs only when the real '@babel/core config with ts' suite is skipped (Node < 12 or USE_ESM); on this leg the real suite runs instead";
+      if (/shouldSkip\s*\?\s*describe\.skip/.test(c)) return "ts-node config tests need Node >= 12 and the CommonJS build (shouldSkip = Node < 12 || USE_ESM); this leg runs Node " + process.versions.node;
+      if (/v\(\?:6\|8\|10\)/.test(c)) return "test requires Node >= 12 (nodeGte12 gate skips Node 6/8/10); this leg runs Node " + process.versions.node;
+      if (/win32/.test(c)) return "test does not support Windows (process.platform === \"win32\" gate)";
+      if (/v6\./.test(c)) return "test requires Node >= 8; skipped on Node 6";
+      var m = c.match(/>=\s*(\d+)\s*\?\s*(it|test|describe)\s*:/);
+      if (m) return "test requires Node >= " + m[1] + "; this leg runs Node " + process.versions.node;
+      if (/supportsESM/.test(c)) return "test needs native ESM support, which this Node (" + process.versions.node + ") lacks";
+      if (/outputType\s*===\s*"module"/.test(c)) return "test only applies to the ESM build of @babel/core";
+      if (/^(it|test|describe)\.skip$/.test(c)) return "disabled upstream with an unconditional " + c + " in the test source";
+      return null;
+    }
+    function defOf(f, name) {
+      var files = [f];
+      var lines = src(f);
+      lines.forEach(function (l) {
+        var m = l.match(/from\s+["'](\.[^"']+)["']/);
+        if (m && l.indexOf(name) !== -1) files.push(path.resolve(path.dirname(f), m[1]));
+      });
+      var re = new RegExp("\\b(const|let|var|function)\\s+" + name.replace(/\$/g, "\\$") + "\\b");
+      for (var fi = 0; fi < files.length; fi++) {
+        var ls = src(files[fi]);
+        for (var i = 0; i < ls.length; i++) {
+          if (re.test(ls[i])) {
+            var j = i;
+            while (j < i + 4 && j < ls.length - 1 && ls[j].indexOf(";") === -1) j++;
+            return ls.slice(i, j + 1).join(" ");
+          }
+        }
+      }
+      return null;
+    }
+    function findTitle(lines, t) {
+      for (var i = 0; i < lines.length; i++) {
+        var l = lines[i];
+        if (l.indexOf('"' + t + '"') !== -1 || l.indexOf("'" + t + "'") !== -1 || l.indexOf("`" + t + "`") !== -1) return i;
+      }
+      return -1;
+    }
+    function sourceReason(tr, a) {
+      var lines = src(tr.name);
+      var titles = [a.title].concat(a.ancestorTitles.slice().reverse());
+      for (var k = 0; k < titles.length; k++) {
+        var i = findTitle(lines, titles[k]);
+        if (i < 0) continue;
+        var win = lines.slice(Math.max(0, i - 3), i + 1).join("\n");
+        var cut = win.lastIndexOf(lines[i]);
+        // Cut the line where the quoted title starts (not at the first quote:
+        // a gate such as `outputType === "module" ? ...` has quotes of its own).
+        var tpos = -1;
+        ['"', "'", "`"].forEach(function (q) {
+          var p = lines[i].indexOf(q + titles[k] + q);
+          if (p >= 0 && (tpos < 0 || p < tpos)) tpos = p;
+        });
+        var head = win.slice(0, cut) + lines[i].slice(0, tpos >= 0 ? tpos : lines[i].length);
+        // describeGte("16.0.0")(...) / itGte(...) from $repo-utils skip on older Node.
+        var gte = head.match(/\b(?:describe|it|test)Gte\(\s*["']([\d.]+)["']\s*\)\s*\(\s*$/);
+        if (gte)
+          return "test requires Node >= " + gte[1] + " (" + gte[0].replace(/\(\s*$/, "").trim() + " gate from $repo-utils); this leg runs Node " + process.versions.node + " [line " + (i + 1) + "]";
+        var direct = head.match(/\(([^()]*\?[^()]*\.skip[^()]*)\)\s*\(\s*$/) || head.match(/((?:it|test|describe)\.skip)\s*\(\s*$/);
+        if (direct) {
+          var why = explain(direct[1]);
+          return (why || "gated by condition") + " [" + direct[1].replace(/\s+/g, " ").trim() + ", line " + (i + 1) + "]";
+        }
+        // Also matches wrappers that take the test function first: nodeGte12(describe, "title", ...)
+        var callee = head.match(/([A-Za-z_$][\w$]*)\s*\(\s*(?:(?:it|test|describe)\s*,\s*)?$/);
+        if (callee && !/^(it|test|describe)$/.test(callee[1])) {
+          var d = defOf(tr.name, callee[1]);
+          if (d && /\.skip/.test(d)) {
+            var w2 = explain(d);
+            return (w2 || "gated by helper") + " [" + callee[1] + " := " + d.replace(/\s+/g, " ").trim().slice(0, 160) + "]";
+          }
+        }
+      }
+      return null;
+    }
+    var counts = Object.create(null);
+    var total = 0;
+    var out = [];
+    var suitesOut = [];
+    (res.testResults || []).forEach(function (tr) {
+      var ars = tr.assertionResults || [];
+      var fileReasons = [];
+      ars.forEach(function (a) {
+        if (a.status !== "pending" && a.status !== "todo" && a.status !== "skipped") return;
+        total++;
+        var reason = fixtureReason(tr, a) || batchReason(tr, a) || sourceReason(tr, a);
+        if (!reason) {
+          var gates = src(tr.name).filter(function (l) {
+            return /\.skip\b/.test(l);
+          }).map(function (l) {
+            return l.trim();
+          });
+          reason = "skipped by an upstream gate in this file: " + (gates.join(" | ").slice(0, 300) || "(" + a.status + ")");
+        }
+        var cat = reason.replace(/ \[.*$/, "").replace(/fixture \S+ /, "fixture ").replace(/ fixture \S+ \(/, " fixture (");
+        counts[cat] = (counts[cat] || 0) + 1;
+        if (fileReasons.indexOf(cat) === -1) fileReasons.push(cat);
+        out.push("SKIPPED " + path.relative(root, tr.name).replace(/\\/g, "/") + " > " + a.ancestorTitles.concat([a.title]).join(" > ") + " -- reason: " + reason);
+      });
+      // Jest reports a file whose every test is skipped as a skipped test suite.
+      var skippedHere = ars.filter(function (a) {
+        return a.status === "pending" || a.status === "todo" || a.status === "skipped";
+      }).length;
+      if (ars.length && skippedHere === ars.length) {
+        suitesOut.push("SKIPPED SUITE " + path.relative(root, tr.name).replace(/\\/g, "/") + " (all " + ars.length + " tests skipped) -- reason: " + fileReasons.join("; "));
+      }
+    });
+    console.log("===== Jest skipped tests (" + total + "), each with the reason it does not run on this leg =====");
+    out.forEach(function (l) {
+      console.log(l);
+    });
+    console.log("===== Jest test suites (files) with every test skipped (" + suitesOut.length + ") =====");
+    suitesOut.forEach(function (l) {
+      console.log(l);
+    });
+    console.log("===== Skipped-test reasons summary (Node " + process.versions.node + ", " + process.platform + ", BABEL_8_BREAKING=" + babel8 + ") =====");
+    Object.keys(counts).sort(function (x, y) {
+      return counts[y] - counts[x];
+    }).forEach(function (k) {
+      console.log(counts[k] + "\t" + k);
+    });
+    console.log("Jest totals: " + res.numPassedTests + " passed, " + res.numFailedTests + " failed, " + res.numPendingTests + " skipped, " + (res.numTodoTests || 0) + " todo, " + res.numTotalTests + " total");
 
 permissions:
   contents: read
@@ -13,6 +312,7 @@ jobs:
   prepare-yarn-cache:
     name: Prepare Cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,6 +334,7 @@ jobs:
     name: Validate Yarn dependencies and constraints
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -63,6 +364,7 @@ jobs:
     name: Test on Node.js Latest
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -74,17 +376,20 @@ jobs:
           cache: "yarn"
       - name: Generate coverage report
         run: |
-          make -j test-ci-coverage
+          make -j test-ci-coverage SEAL_JEST_ARGS='${{ inputs.test-filter }} --json --outputFile="${{ runner.temp }}/jest-results.json"'
           yarn test:esm
         env:
           BABEL_CLI_FLAKY_TESTS: true
-      - name: Upload coverage report
-        uses: codecov/codecov-action@v3
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   test-esm:
     name: Test ESM version
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -99,16 +404,21 @@ jobs:
         env:
           USE_ESM: true
       - name: Test
-        run: yarn jest --ci
+        run: yarn jest --ci ${{ inputs.test-filter }} --json --outputFile="${{ runner.temp }}/jest-results.json"
         env:
           BABEL_ENV: test
           USE_ESM: true
           BABEL_CLI_FLAKY_TESTS: trues
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   build:
     name: Build Babel Artifacts
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
@@ -140,7 +450,7 @@ jobs:
       - name: Prepare artifacts
         run: |
           ./scripts/get-artifact-files.sh | tar --null -cvf babel-artifact.tar --files-from=-
-      - uses: actions/upload-artifact@v3
+      - uses: actions/upload-artifact@v4
         with:
           name: babel-artifact
           path: babel-artifact.tar
@@ -149,6 +459,7 @@ jobs:
   build-windows:
     name: Build Babel Artifacts on Windows
     runs-on: windows-latest
+    timeout-minutes: 50
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
@@ -177,6 +488,7 @@ jobs:
     name: Lint
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -188,7 +500,7 @@ jobs:
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -203,10 +515,19 @@ jobs:
     name: Test on Node.js # GitHub will add ${{ matrix.node-version }} to this title
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
         node-version: [20, 18, 16, 14, 12, 10, 8, 6]
+    env:
+      # The Node <= 12 legs re-resolve dependencies ("yarn up jest@24/28");
+      # resolve them as of the release date so they still support old Node.
+      YARN_NPM_REGISTRY_SERVER: ${{ (matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10' || matrix.node-version == '12') && 'https://time-machines-npm.sealsecurity.io/' || 'https://registry.yarnpkg.com' }}
+      YARN_NPM_AUTH_TOKEN: "2024-06-05"
+      YARN_NPM_ALWAYS_AUTH: "true"
+      YARN_CHECKSUM_BEHAVIOR: update
+      YARN_ENABLE_IMMUTABLE_INSTALLS: "false"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -224,7 +545,7 @@ jobs:
         run: |
           # It's a bit sarcastic that in this scenario bump-babel-dependencies.js
           # actually downgrades the root `@babel/*` deps from 8.0 alpha to 7
-          node ./scripts/integration-tests/utils/bump-babel-dependencies.js
+          BABEL_DEP_VERSION="^7.0.0" node ./scripts/integration-tests/utils/bump-babel-dependencies.js
           yarn up jest@24
           cd packages/babel-helper-transform-fixture-test-runner && yarn up jest-diff@24 && cd ../..
           # Deduplicate dependencies, because duplicate copies of graceful-fs cause
@@ -239,7 +560,7 @@ jobs:
           # Deduplicate dependencies, because duplicate copies of graceful-fs cause
           # problems with the "path" module: https://github.com/facebook/jest/issues/9656
           yarn dedupe
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -251,10 +572,14 @@ jobs:
       - name: Test on node.js ${{ matrix.node-version }}
         # Todo(Babel 8): Jest execution path is hardcoded because Yarn 2 does not support node 6
         run: |
-          BABEL_ENV=test node --max-old-space-size=4096 ./node_modules/.bin/jest --ci
+          BABEL_ENV=test node --max-old-space-size=4096 ./node_modules/.bin/jest --ci ${{ inputs.test-filter }} --json --outputFile="${{ runner.temp }}/jest-results.json"
         env:
           BABEL_CLI_FLAKY_TESTS: true
           TEST_FUZZ: "${{ (matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10') && 'false' || 'true' }}"
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
       - name: Use Node.js latest # For `yarn version` in post actions of the first actions/setup-node
         if: matrix.node-version == '6' || matrix.node-version == '8' || matrix.node-version == '10'
         uses: actions/setup-node@v4
@@ -265,6 +590,7 @@ jobs:
     name: Build Babel 8 Artifacts
     needs: prepare-yarn-cache
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     # Yarn PnP does not support native ESM yet (https://github.com/yarnpkg/berry/issues/638)
     # env:
     #    YARN_NODE_LINKER: pnp # use pnp linker for better linking performance and stricter checks
@@ -294,11 +620,11 @@ jobs:
           BABEL_TYPES_8_BREAKING: true
       - name: Prepare artifacts
         run: |
-          ./scripts/get-artifact-files.sh | tar --null -cvf babel-artifact.tar --files-from=-
-      - uses: actions/upload-artifact@v3
+          ./scripts/get-artifact-files.sh | tar --null -cvf babel8-artifact.tar --files-from=-
+      - uses: actions/upload-artifact@v4
         with:
           name: babel8-artifact
-          path: babel-artifact.tar
+          path: babel8-artifact.tar
           retention-days: 5
 
   test-babel-8-breaking:
@@ -309,6 +635,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -319,20 +646,26 @@ jobs:
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel8-artifact
       - name: Extract artifacts
-        run: tar -xf babel-artifact.tar; rm babel-artifact.tar
+        run: tar -xf babel8-artifact.tar; rm babel8-artifact.tar
       - name: Use ESM
         run: node scripts/set-module-type.js module
       - name: Test
-        run: yarn jest --ci
+        run: yarn jest --ci ${{ inputs.test-filter }} --json --outputFile="${{ runner.temp }}/jest-results.json"
         env:
           BABEL_ENV: test
           BABEL_8_BREAKING: true
           BABEL_TYPES_8_BREAKING: true
           BABEL_CLI_FLAKY_TESTS: true
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
+        env:
+          BABEL_8_BREAKING: true
       - name: Test ESM
         run: yarn test:esm
         env:
@@ -349,6 +682,7 @@ jobs:
       matrix:
         os: [windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -360,21 +694,26 @@ jobs:
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
         run: tar -xf babel-artifact.tar; rm babel-artifact.tar
       - name: Test
-        run: yarn jest --ci
+        run: yarn jest --ci ${{ inputs.test-filter }} --json --outputFile="${{ runner.temp }}/jest-results.json"
         env:
           BABEL_ENV: test
           BABEL_CLI_FLAKY_TESTS: true
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   external-parser-tests:
     name: Third-party Parser Tests
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -386,7 +725,7 @@ jobs:
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -404,6 +743,7 @@ jobs:
     name: Test @babel/runtime integrations
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -435,7 +775,7 @@ jobs:
           # The "Support self-references on old Node.js" step mutates the
           # package.json file, causing a yarn.lock update.
           YARN_ENABLE_IMMUTABLE_INSTALLS: false
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -511,6 +851,7 @@ jobs:
     name: Test @babel/eslint-* with ESLint 7.5.0
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -522,7 +863,7 @@ jobs:
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -530,24 +871,29 @@ jobs:
       - name: Downgrade ESLint to 7.5.0
         run: yarn up eslint@7.5.0
       - name: Run babel/eslint tests
-        run: node ./node_modules/.bin/jest eslint
+        run: node ./node_modules/.bin/jest eslint --json --outputFile="${{ runner.temp }}/jest-results.json"
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   eslint8-test:
     name: Test @babel/eslint-* with ESLint 8.0.0
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Use Node.js latest
         uses: actions/setup-node@v4
         with:
-          node-version: latest
+          node-version: 22.1
           check-latest: true
           cache: "yarn"
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -555,11 +901,16 @@ jobs:
       - name: Downgrade ESLint to 8.0.0
         run: yarn up eslint@8.0.0
       - name: Run babel/eslint tests
-        run: node ./node_modules/.bin/jest eslint
+        run: node ./node_modules/.bin/jest eslint --json --outputFile="${{ runner.temp }}/jest-results.json"
+      - name: Report skipped tests
+        if: always()
+        shell: bash
+        run: node -e "$SEAL_JEST_SKIP_REPORT" "${{ runner.temp }}/jest-results.json"
 
   test262-prepare:
     name: test262 - Prepare for running in parallel
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     if: github.repository == 'babel/babel'
     steps:
       - name: Checkout Babel
@@ -585,7 +936,7 @@ jobs:
         env:
           TEST262_PATH: ../build/test262
       - name: Upload chunks artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test262-chunks
           path: ~/test262-chunks.json
@@ -597,6 +948,7 @@ jobs:
       matrix:
         chunk: [0, 1, 2, 3, 4, 5, 6, 7]
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     needs: [build, test262-prepare]
     steps:
       - name: Checkout Babel
@@ -608,7 +960,7 @@ jobs:
           check-latest: true
       - name: Install
         run: yarn install
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with:
           name: babel-artifact
       - name: Extract artifacts
@@ -627,7 +979,7 @@ jobs:
       - name: Download test262
         run: make bootstrap-test262
       - name: Download chunks file
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: test262-chunks
       - name: Run test262
@@ -641,7 +993,7 @@ jobs:
           CHUNKS_FILE: ../test262-chunks.json
           CHUNK: ${{ matrix.chunk }}
       - name: Create artifact with report results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test262-result-${{ matrix.chunk }}
           path: ~/test262-${{ matrix.chunk }}.tap
@@ -650,23 +1002,24 @@ jobs:
   test262-finish:
     name: test262 - Analyze results
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     needs: test262
     steps:
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-0 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-1 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-2 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-3 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-4 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-5 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-6 }
-      - uses: actions/download-artifact@v3
+      - uses: actions/download-artifact@v4
         with: { name: test262-result-7 }
       - name: Merge chunk results
         run: |
@@ -674,7 +1027,7 @@ jobs:
               test262-4.tap test262-5.tap test262-6.tap test262-7.tap \
             | npx tap-merge > test262.tap
       - name: Create artifact with report results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test262-result
           path: test262.tap
@@ -698,3 +1051,36 @@ jobs:
         # Specify bash to enable pipefail, so that "| tee" does not suppress the failure exit code.
         # https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsshell
         shell: bash
+
+  pack-npm-artifacts:
+    name: Pack @babel/helpers npm tarball
+    needs: prepare-yarn-cache
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Use Node.js latest
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.1
+          check-latest: true
+          cache: "yarn"
+      - name: Install
+        run: yarn install
+      - name: Build publishable packages (as `make prepublish` does)
+        run: make prepublish-build
+        env:
+          BABEL_8_BREAKING: ""
+      - name: Remove dev-only lib/package.json module-type markers
+        run: node ./scripts/set-module-type.js clean
+      - name: Pack @babel/helpers
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/seal-artifacts"
+          yarn workspace @babel/helpers pack --out "$GITHUB_WORKSPACE/seal-artifacts/helpers-%v.tgz"
+          tar -tzvf "$GITHUB_WORKSPACE/seal-artifacts/helpers-7.24.7.tgz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seal-npm-tarball
+          path: seal-artifacts/*.tgz
+          if-no-files-found: error

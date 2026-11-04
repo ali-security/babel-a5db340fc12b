@@ -407,6 +407,12 @@ function spawnNodeAsync(args, cwd = __dirname, env) {
     cwd,
     env: {
       ...env,
+      // browserslist writes a "caniuse-lite is outdated" warning to stderr
+      // once its pinned caniuse-lite data is more than 6 months old, which is
+      // unavoidable when this release is rebuilt long after it was published.
+      // `output` concatenates stderr into stdout, so the warning would corrupt
+      // the inline snapshots / JSON.parse calls in this file.
+      BROWSERSLIST_IGNORE_OLD_DATA: "1",
       ...(process.env.BABEL_8_BREAKING && {
         BABEL_8_BREAKING: process.env.BABEL_8_BREAKING,
       }),

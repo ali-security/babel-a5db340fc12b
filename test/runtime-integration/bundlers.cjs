@@ -33,7 +33,16 @@ function test(name, command, directory, output, first) {
   });
 
   const expectedPath = path.join(__dirname, "expected-bundler.txt");
-  const expected = fs.readFileSync(expectedPath, "utf8");
+  let expected = fs.readFileSync(expectedPath, "utf8");
+  if (directory === "rollup") {
+    // expected-bundler.txt is generated from the Webpack 5 run; Rollup's
+    // CommonJS interop exposes the require()d ESM helper as the function
+    // itself, so `typeof toPrimitive` legitimately differs for Rollup.
+    expected = expected.replace(
+      /^typeof toPrimitive: object$/m,
+      "typeof toPrimitive: function",
+    );
+  }
 
   if (expected === out) {
     console.log("OK");
@@ -43,5 +52,7 @@ function test(name, command, directory, output, first) {
   } else {
     console.error("FAILED\n");
     console.error(out);
+    // Report the failure through the exit code, so CI does not stay green.
+    process.exitCode = 1;
   }
 }

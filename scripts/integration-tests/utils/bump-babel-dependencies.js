@@ -5,6 +5,10 @@ const packageJSONPath = path.resolve(process.cwd(), "./package.json");
 const content = (await import(packageJSONPath, { with: { type: "json" } }))
   .default;
 
+// The "latest" dist-tag of @babel/* is Babel 8 (ESM-only) today, which the
+// Node 6/8/10 legs cannot load; let CI pin the 7.x line explicitly.
+const targetVersion = process.env.BABEL_DEP_VERSION || "latest";
+
 function bumpBabelDependency(type, version) {
   const dependencies = content[type];
   for (const dep of Object.keys(dependencies)) {
@@ -29,10 +33,10 @@ if (process.argv[2] === "resolutions") {
     bumpBabelDependency("peerDependencies", "*");
   }
   if ("devDependencies" in content) {
-    bumpBabelDependency("devDependencies", "latest");
+    bumpBabelDependency("devDependencies", targetVersion);
   }
   if ("dependencies" in content) {
-    bumpBabelDependency("dependencies", "latest");
+    bumpBabelDependency("dependencies", targetVersion);
   }
 }
 
